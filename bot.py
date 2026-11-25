@@ -991,21 +991,35 @@ async def post_stop(app: Application) -> None:
 def main() -> None:
     if not BOT_TOKEN:
         raise SystemExit("Set the BOT_TOKEN environment variable.")
-    app = Application.builder().token(BOT_TOKEN).post_init(post_init).post_stop(post_stop).build()
-    private = filters.ChatType.PRIVATE
-    app.add_handler(CommandHandler("start", start, filters=private))
-    app.add_handler(CommandHandler("pending", cmd_pending, filters=private))
-    app.add_handler(CommandHandler("stats", cmd_stats, filters=private))
-    app.add_handler(CommandHandler("backup", cmd_backup, filters=private))
-    app.add_handler(CommandHandler("restore", cmd_restore, filters=private))
-    app.add_handler(CallbackQueryHandler(on_admin_callback, pattern=r"^adm:"))
-    app.add_handler(CallbackQueryHandler(on_callback))
-    app.add_handler(MessageHandler(private & (filters.PHOTO | filters.Document.IMAGE), on_image))
-    app.add_handler(MessageHandler(private & filters.TEXT & ~filters.COMMAND, on_text))
-    app.add_handler(MessageHandler(
-        private & ~filters.TEXT & ~filters.COMMAND & ~filters.PHOTO & ~filters.Document.IMAGE, on_other))
-    app.add_error_handler(on_error)
-    app.run_polling(allowed_updates=Update.ALL_TYPES)
+
+    # Python 3.14 no longer implicitly creates a current event loop in the
+    # main thread. python-telegram-bot's run_polling() expects one to exist.
+    # Create and register it explicitly before building/running the app.
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+
+    try:
+        app = Application.builder().token(BOT_TOKEN).post_init(post_init).post_stop(post_stop).build()
+        private = filters.ChatType.PRIVATE
+        app.add_handler(CommandHandler("start", start, filters=private))
+        app.add_handler(CommandHandler("pending", cmd_pending, filters=private))
+        app.add_handler(CommandHandler("stats", cmd_stats, filters=private))
+        app.add_handler(CommandHandler("backup", cmd_backup, filters=private))
+        app.add_handler(CommandHandler("restore", cmd_restore, filters=private))
+        app.add_handler(CallbackQueryHandler(on_admin_callback, pattern=r"^adm:"))
+        app.add_handler(CallbackQueryHandler(on_callback))
+        app.add_handler(MessageHandler(private & (filters.PHOTO | filters.Document.IMAGE), on_image))
+        app.add_handler(MessageHandler(private & filters.TEXT & ~filters.COMMAND, on_text))
+        app.add_handler(MessageHandler(
+            private & ~filters.TEXT & ~filters.COMMAND & ~filters.PHOTO & ~filters.Document.IMAGE, on_other))
+        app.add_error_handler(on_error)
+        app.run_polling(allowed_updates=Update.ALL_TYPES)
+    finally:
+        # run_polling normally closes the loop itself. This also handles
+        # failures that happen before run_polling gets that far.
+        if not loop.is_closed():
+            loop.close()
+        asyncio.set_event_loop(None)
 
 
 if __name__ == "__main__":
