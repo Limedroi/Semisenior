@@ -31,10 +31,10 @@ Railway variables (all optional except BOT_TOKEN):
     REMINDER_AFTER_HOURS   remind the admins about applications pending longer than this (default 6)
     MAX_CONCURRENT_UPDATES updates handled at the same time (default 128)
 
-Admin commands (private chat): /pending /summary /stats /export /open /close /limit /health /backup /restore
+Admin commands (private chat): /pending /summary /stats /export /open /close /limit /backup /restore
                                /setwelcome (reply to a photo) /clearwelcome
-                               /search <id | name | phone | @username | telegram id>   /retry (re-send failed admin notifications)
-                               /intro (pick the ASCII intro: 5 styles x 3 modes, with a live preview)
+                               /search <id | name | phone | @username | telegram id>   /retry
+Developer commands (940770584 only): /health /intro (configure and preview the ASCII intro)
 Student commands: /start /status /edit_request  (also reachable from /status, ✏️ "طلب تعديل" to correct an answer after submitting —
                   the change is applied and the admins get a before/after message)
 
@@ -92,7 +92,8 @@ _STARTED_AT = time.time()
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
 GROUP_ID = int(os.environ.get("GROUP_ID", "-1005980424677"))                  # accepted applications only
 STORAGE_GROUP_ID = int(os.environ.get("STORAGE_GROUP_ID", "-1005738619227"))  # pinned backups live here
-_DEFAULT_ADMIN_IDS = "5242845517,940770584"      # the only people who can use the admin commands / accept applications
+_DEFAULT_ADMIN_IDS = "5242845517,940770584"      # admins can manage applications
+DEVELOPER_ID = 940770584                         # only this account sees /health and /intro
 ADMIN_IDS = {int(x) for x in re.split(r"[,\s]+", (os.environ.get("ADMIN_IDS") or _DEFAULT_ADMIN_IDS).strip()) if x.lstrip("-").isdigit()}
 DATA_DIR = os.environ.get("DATA_DIR", ".")
 DATA_FILE = os.path.join(DATA_DIR, "semi_senior_data.json")
@@ -123,63 +124,29 @@ MAX_EDITS_PER_APP = 5                         # corrections one application may 
 MAX_EDIT_NOTICE_TRIES = 30                    # how many times an unsent "before vs after" notice is retried
 NOTIFY_RETRY_MIN_AGE = 120                    # seconds: a notification younger than this may still be on its way
 
-# ── First-time onboarding: SEMI SENIOR, one big ASCII letter per message ───────
+# ── First-time onboarding: compact Telegram-safe SEMI SENIOR lettering ────────
+# Six-row block lettering; the widest complete word (SENIOR) stays about 31
+# monospace columns wide, so it remains readable in Telegram on a phone.
 ONBOARDING_DELAY = 0.6      # seconds between the letters
 ASCII_LETTERS = {
-    "S": [" #### ",
-          "#     ",
-          " ###  ",
-          "     #",
-          " #### "],
-    "E": ["######",
-          "#     ",
-          "####  ",
-          "#     ",
-          "######"],
-    "M": ["#    #",
-          "##  ##",
-          "# ## #",
-          "#    #",
-          "#    #"],
-    "I": ["######",
-          "  ##  ",
-          "  ##  ",
-          "  ##  ",
-          "######"],
-    "N": ["#    #",
-          "##   #",
-          "# #  #",
-          "#  # #",
-          "#   ##"],
-    "O": [" #### ",
-          "#    #",
-          "#    #",
-          "#    #",
-          " #### "],
-    "R": ["##### ",
-          "#    #",
-          "##### ",
-          "#   # ",
-          "#    #"],
+    "S": ["####", "#   ", "#   ", " ###", "   #", "   #", "####"],
+    "E": ["####", "#   ", "#   ", "### ", "#   ", "#   ", "####"],
+    "M": ["#   #", "## ##", "# # #", "#   #", "#   #", "#   #", "#   #"],
+    "I": ["###", " # ", " # ", " # ", " # ", " # ", "###"],
+    "N": ["#   #", "##  #", "# # #", "#  ##", "#   #", "#   #", "#   #"],
+    "O": [" ### ", "#   #", "#   #", "#   #", "#   #", "#   #", " ### "],
+    "R": ["### ", "#  #", "#  #", "### ", "# # ", "#  #", "#  #"],
 }
 ONBOARDING_WORD = "SEMISENIOR"
 
-# Compact letters (3-5 columns wide) so a whole word fits on a phone screen: used by the "words" and "morph" modes.
-ASCII_SMALL = {
-    "S": ["###", "#  ", "###", "  #", "###"],
-    "E": ["###", "#  ", "###", "#  ", "###"],
-    "M": ["#   #", "## ##", "# # #", "#   #", "#   #"],
-    "I": ["###", " # ", " # ", " # ", "###"],
-    "N": ["#  #", "## #", "# ##", "#  #", "#  #"],
-    "O": ["###", "# #", "# #", "# #", "###"],
-    "R": ["## ", "# #", "## ", "# #", "# #"],
-}
-# key -> (button label, fill character). The letter shapes are the same; the fill is what changes ("shadow" draws a drop shadow).
+# The same carefully spaced glyphs are used for single-letter and whole-word modes.
+# Different fills change the texture without changing the letter proportions.
+ASCII_SMALL = ASCII_LETTERS
 INTRO_STYLES = {
     "hash":   ("# هاش", "#"),
-    "solid":  ("█ مصمت", "█"),
+    "solid":  ("█ بلوك", "█"),
     "star":   ("* نجوم", "*"),
-    "dot":    ("o دواير", "o"),
+    "dot":    ("· نقط", "·"),
     "shadow": ("▒ ظل", None),
 }
 INTRO_MODES = {
@@ -187,7 +154,7 @@ INTRO_MODES = {
     "words":   "2️⃣ رسالة SEMI + رسالة SENIOR",
     "morph":   "3️⃣ SEMI تتحول لـ SENIOR وتختفي",
 }
-INTRO_DEFAULT = ("hash", "letters")   # until an admin picks one with /intro
+INTRO_DEFAULT = ("solid", "words")   # clean block lettering, shown in two phone-friendly lines
 INTRO_EVERY_START = False   # False = the intro plays the first time a person ever presses /start; True = on every /start
 INTRO_WORD_DELAY = 0.9      # "words" mode: seconds between SEMI and SENIOR
 INTRO_MORPH_FIRST = 1.5     # "morph" mode: how long SEMI shows before it turns into SENIOR
@@ -1739,6 +1706,11 @@ def _is_admin(user) -> bool:
     return user is not None and user.id in ADMIN_IDS
 
 
+def _is_developer(user) -> bool:
+    # Developer tools are deliberately narrower than normal admin permissions.
+    return _is_admin(user) and user.id == DEVELOPER_ID
+
+
 def _admin_caption_ex(rec: dict, title: str, footer: str = "", warn: bool = True, pointer: bool = False):
     """-> (caption, truncated). `truncated` = somebody who used the same screenshot isn't named on the card because a
     photo caption may not exceed 1024 characters — the caller then sends _dup_detail_message as a reply."""
@@ -1953,6 +1925,15 @@ def admin_only(fn):
     return serialized(wrapper)
 
 
+def developer_only(fn):
+    @functools.wraps(fn)
+    async def wrapper(update, context):
+        if not _is_developer(update.effective_user):
+            return
+        return await fn(update, context)
+    return serialized(wrapper)
+
+
 @admin_only
 async def cmd_pending(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     pending = sorted((r for r in DATA["applications"].values() if r["status"] == "pending"), key=lambda r: r["id"])
@@ -2135,7 +2116,7 @@ def _rss_mb():
     return None
 
 
-@admin_only
+@developer_only
 async def cmd_health(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     up = int(time.time() - _STARTED_AT)
     c = _counts()
@@ -2209,7 +2190,7 @@ def _intro_home_payload():
     return text, InlineKeyboardMarkup(rows)
 
 
-@admin_only
+@developer_only
 async def cmd_intro(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     text, kb = _intro_home_payload()
     await update.message.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=kb)
@@ -2223,7 +2204,7 @@ async def _delete_intro_previews(context, chat_id: int, keep=None) -> None:
 @serialized
 async def on_intro_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     q = update.callback_query
-    if not _is_admin(q.from_user):
+    if not _is_developer(q.from_user):
         await q.answer("مش مسموحلك تعمل كده", show_alert=True)
         return
     chat_id = q.from_user.id
@@ -2732,10 +2713,14 @@ ADMIN_COMMANDS = STUDENT_COMMANDS + [
     BotCommand("pending", "الطلبات المعلقة"), BotCommand("summary", "ملخص الطلبات والمقاسات"),
     BotCommand("stats", "أرقام سريعة"), BotCommand("export", "تصدير الطلبات CSV"),
     BotCommand("open", "فتح الحجز"), BotCommand("close", "قفل الحجز"), BotCommand("limit", "حد المقاسات"),
-    BotCommand("health", "حالة البوت"), BotCommand("backup", "نسخة احتياطية الآن"), BotCommand("restore", "استعادة"),
+    BotCommand("backup", "نسخة احتياطية الآن"), BotCommand("restore", "استعادة"),
     BotCommand("setwelcome", "صورة الترحيب (ريبلاي على صورة)"), BotCommand("clearwelcome", "شيل صورة الترحيب"),
-    BotCommand("search", "بحث برقم الطلب / الاسم / الرقم / اليوزر"), BotCommand("retry", "إعادة إرسال الإشعارات الفاشلة"),
-    BotCommand("intro", "اختار الإنترو (ASCII) اللي بيظهر للكل"),
+    BotCommand("search", "بحث برقم الطلب / الاسم / الرقم / اليوزر"),
+    BotCommand("retry", "إعادة إرسال الإشعارات الفاشلة"),
+]
+DEVELOPER_COMMANDS = ADMIN_COMMANDS + [
+    BotCommand("health", "حالة البوت"),
+    BotCommand("intro", "إعداد ومعاينة إنترو ASCII"),
 ]
 
 
@@ -2751,10 +2736,11 @@ async def post_init(app: Application) -> None:
                 pass
     if not ADMIN_IDS:
         log.warning("ADMIN_IDS is empty: applications will be saved as pending but no admin can accept them.")
-    try:      # the "/" menu: students see two commands, each admin sees all of theirs
+    try:      # Telegram scopes: students by default, admins per-chat, developer gets the extra tools.
         await app.bot.set_my_commands(STUDENT_COMMANDS, scope=BotCommandScopeAllPrivateChats())
         for admin_id in ADMIN_IDS:
-            await app.bot.set_my_commands(ADMIN_COMMANDS, scope=BotCommandScopeChat(admin_id))
+            commands = DEVELOPER_COMMANDS if admin_id == DEVELOPER_ID else ADMIN_COMMANDS
+            await app.bot.set_my_commands(commands, scope=BotCommandScopeChat(admin_id))
     except Exception as e:
         log.warning("Couldn't set the command menu: %s", e)
     request_backup(urgent=False)   # the first loop pass uploads only if something differs from the restored backup
