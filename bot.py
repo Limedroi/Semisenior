@@ -33,7 +33,10 @@ Railway variables (all optional except BOT_TOKEN):
 
 Admin commands (private chat): /pending /summary /stats /export /open /close /limit /health /backup /restore
                                /setwelcome (reply to a photo) /clearwelcome
-Student commands: /start /status
+                               /search <id | name | phone | @username | telegram id>   /retry (re-send failed admin notifications)
+                               /intro (pick the ASCII intro: 5 styles x 3 modes, with a live preview)
+Student commands: /start /status /edit_request  (also reachable from /status, ✏️ "طلب تعديل" to correct an answer after submitting —
+                  the change is applied and the admins get a before/after message)
 
 requirements.txt:  python-telegram-bot[rate-limiter]>=21.0,<22
 """
@@ -41,12 +44,14 @@ requirements.txt:  python-telegram-bot[rate-limiter]>=21.0,<22
 import asyncio
 import csv
 import functools
+import glob
 import hashlib
 import html
 import json
 import logging
 import os
 import re
+import shutil
 import time
 import weakref
 import zipfile
@@ -62,6 +67,8 @@ from telegram import (
     InlineKeyboardButton,
     InlineKeyboardMarkup,
     InputFile,
+    InputMediaDocument,
+    InputMediaPhoto,
     LinkPreviewOptions,
     ReplyParameters,
     Update,
@@ -91,6 +98,9 @@ DATA_DIR = os.environ.get("DATA_DIR", ".")
 DATA_FILE = os.path.join(DATA_DIR, "semi_senior_data.json")
 BACKUP_STATE_FILE = os.path.join(DATA_DIR, "semi_senior_backup_state.json")
 BACKUP_MARKER = "🗄 SEMI_SENIOR_STORAGE_BACKUP"      # caption that identifies the pinned backup
+SCHEMA_VERSION = 1                                   # bump when the data layout changes, and add a step to _migrate()
+BACKUP_MANIFEST_NAME = "manifest.json"               # member inside the backup zip: version, checksum, record counts
+MAX_BACKUP_BYTES = 100 * 1024 * 1024                 # a backup bigger than this (unpacked or downloaded) is refused
 BACKUP_JSON_NAME = "semi_senior_data.json"           # member inside the backup zip
 BACKUP_MIN_INTERVAL = int(os.environ.get("BACKUP_MIN_INTERVAL", "60"))
 DRAFT_BACKUP_MIN_INTERVAL = int(os.environ.get("DRAFT_BACKUP_MIN_INTERVAL", "300"))
@@ -107,6 +117,11 @@ WARN_MAX_PEOPLE = 10                                 # how many other people are
 TZ = ZoneInfo("Africa/Cairo")
 SIZE_GUIDE_URL = "https://t.me/Semi_senior44/2194"
 MIN_NAME_WORDS = 2          # "الاسم الكامل" — set to 1 to accept a single word
+DELETE_USER_ENTRIES = True  # True = the student's typed answer / screenshot is deleted once accepted, so no message is left over
+EDITABLE_STATUSES = ("pending", "accepted")   # students can correct these after submitting (a rejected one: re-send the screenshot)
+MAX_EDITS_PER_APP = 5                         # corrections one application may get
+MAX_EDIT_NOTICE_TRIES = 30                    # how many times an unsent "before vs after" notice is retried
+NOTIFY_RETRY_MIN_AGE = 120                    # seconds: a notification younger than this may still be on its way
 
 # ── First-time onboarding: SEMI SENIOR, one big ASCII letter per message ───────
 ONBOARDING_DELAY = 0.6      # seconds between the letters
@@ -149,6 +164,37 @@ ASCII_LETTERS = {
 }
 ONBOARDING_WORD = "SEMISENIOR"
 
+# Compact letters (3-5 columns wide) so a whole word fits on a phone screen: used by the "words" and "morph" modes.
+ASCII_SMALL = {
+    "S": ["###", "#  ", "###", "  #", "###"],
+    "E": ["###", "#  ", "###", "#  ", "###"],
+    "M": ["#   #", "## ##", "# # #", "#   #", "#   #"],
+    "I": ["###", " # ", " # ", " # ", "###"],
+    "N": ["#  #", "## #", "# ##", "#  #", "#  #"],
+    "O": ["###", "# #", "# #", "# #", "###"],
+    "R": ["## ", "# #", "## ", "# #", "# #"],
+}
+# key -> (button label, fill character). The letter shapes are the same; the fill is what changes ("shadow" draws a drop shadow).
+INTRO_STYLES = {
+    "hash":   ("# هاش", "#"),
+    "solid":  ("█ مصمت", "█"),
+    "star":   ("* نجوم", "*"),
+    "dot":    ("o دواير", "o"),
+    "shadow": ("▒ ظل", None),
+}
+INTRO_MODES = {
+    "letters": "1️⃣ حرف في كل رسالة",
+    "words":   "2️⃣ رسالة SEMI + رسالة SENIOR",
+    "morph":   "3️⃣ SEMI تتحول لـ SENIOR وتختفي",
+}
+INTRO_DEFAULT = ("hash", "letters")   # until an admin picks one with /intro
+INTRO_EVERY_START = False   # False = the intro plays the first time a person ever presses /start; True = on every /start
+INTRO_WORD_DELAY = 0.9      # "words" mode: seconds between SEMI and SENIOR
+INTRO_MORPH_FIRST = 1.5     # "morph" mode: how long SEMI shows before it turns into SENIOR
+INTRO_HOLD = 4              # "morph" mode: how long SENIOR stays before it fades out
+INTRO_FADE_DELAY = 0.7      # "morph" mode: seconds per fade step
+INTRO_DOT_DELAY = 0.5       # seconds between the dots
+
 # ── Texts (edit freely) ───────────────────────────────────────────────────────
 WELCOME_HEAD = "أهلاً بيك في <b>Semi Senior</b> ❤️‍🔥"
 WELCOME_TEXT = f"{WELCOME_HEAD}\n\nاضغط على الزرار اللي تحت عشان تحجز معانا، وهنسألك كام سؤال سريع."
@@ -159,6 +205,7 @@ BACK_BTN = "الرجوع"
 CONFIRM_BTN = "أضغط لتأكيد البيانات"
 RESEND_BTN = "📤 ابعت صورة جديدة"
 USE_USERNAME_BTN = "استخدم @{u} بتاعي"
+EDIT_BTN = "✏️ طلب تعديل"
 
 Q_NAME = "أي هو أسمك الكامل"
 Q_USERNAME = "أي هو اليوزر بتاعك على التليجرام"
@@ -327,6 +374,13 @@ def clean_phone(text: str):
 APP_STATUSES = ("pending", "accepted", "rejected")
 
 
+class _BadBackup(Exception):
+    """A data file / backup that must not be used (damaged, incomplete, or from a newer version)."""
+
+
+_APP_REQUIRED = ("id", "user_id", "status", "created_at", "name", "item", "size")
+
+
 def _valid_data(d) -> bool:
     return (
         isinstance(d, dict)
@@ -335,9 +389,29 @@ def _valid_data(d) -> bool:
         and isinstance(d.get("next_app_id"), int)
         and isinstance(d.get("drafts", {}), dict)
         and isinstance(d.get("settings", {}), dict)
-        and all(isinstance(a, dict) and a.get("status") in APP_STATUSES for a in d["applications"].values())
+        and all(isinstance(a, dict) and a.get("status") in APP_STATUSES and all(k in a for k in _APP_REQUIRED)
+                and str(a["id"]) == str(k) for k, a in d["applications"].items())
         and all(isinstance(u, dict) for u in d["users"].values())
     )
+
+
+def _check_version(d: dict) -> None:
+    """Refuses data written by a NEWER version of the bot — loading it could silently drop what it doesn't know."""
+    v = d.get("schema_version", 0)
+    if isinstance(v, bool) or not isinstance(v, int) or v < 0:
+        raise _BadBackup(f"invalid schema_version {v!r}")
+    if v > SCHEMA_VERSION:
+        raise _BadBackup(f"written by a newer version of the bot (schema {v}; this version understands up to {SCHEMA_VERSION})")
+
+
+def _migrate(d: dict) -> dict:
+    """Brings older data up to SCHEMA_VERSION (in place). Add one `if v < N:` step per future layout change."""
+    v = d.get("schema_version", 0)
+    if v < 1:                      # 0 = written before versioning existed
+        d.setdefault("drafts", {})
+        d.setdefault("settings", {})
+        d["schema_version"] = 1
+    return d
 
 
 def _load_json_file(path: str, default):
@@ -358,16 +432,60 @@ def _load_json_file(path: str, default):
 
 
 def _empty_data() -> dict:
-    return {"users": {}, "applications": {}, "next_app_id": 1, "drafts": {}, "settings": {}}
+    return {"schema_version": SCHEMA_VERSION, "users": {}, "applications": {}, "next_app_id": 1, "drafts": {}, "settings": {}}
 
 
-DATA: dict = _load_json_file(DATA_FILE, None)
-if not _valid_data(DATA):
-    if DATA is not None:
-        log.error("%s has the wrong structure — ignoring it.", DATA_FILE)
-    DATA = _empty_data()
+def _read_data_candidate(path: str):
+    """-> (data, None) when usable, (None, None) when the file doesn't exist, (None, reason) when it must be rejected."""
+    try:
+        with open(path, encoding="utf-8") as f:
+            d = json.load(f)
+    except FileNotFoundError:
+        return None, None
+    except Exception as e:
+        return None, f"unreadable or cut off ({e})"
+    if not isinstance(d, dict):
+        return None, "not a JSON object"
+    try:
+        _check_version(d)
+        d = _migrate(d)
+    except _BadBackup as e:
+        return None, str(e)
+    if not _valid_data(d):
+        return None, "wrong or incomplete structure"
+    return d, None
+
+
+def _load_data_file() -> dict:
+    """The data file; if it's damaged, the previous good copy (.bak); else empty (the storage-group backup then restores it).
+    A rejected file is kept (renamed .corrupt-…) for inspection, never overwritten."""
+    for path in (DATA_FILE, DATA_FILE + ".bak"):
+        d, problem = _read_data_candidate(path)
+        if d is not None:
+            if path != DATA_FILE:
+                log.error("%s was unusable — using the previous good copy %s", DATA_FILE, path)
+            return d
+        if problem:
+            bad = f"{path}.corrupt-{int(time.time())}"
+            try:
+                os.replace(path, bad)
+            except OSError:
+                bad = "(could not move it)"
+            log.error("Rejected %s: %s — moved to %s", path, problem, bad)
+    return _empty_data()
+
+
+for _stale in glob.glob(f"{DATA_FILE}.*tmp") + glob.glob(f"{BACKUP_STATE_FILE}.*tmp"):    # leftovers of an interrupted write
+    try:
+        os.remove(_stale)
+    except OSError:
+        pass
+
+DATA: dict = _load_data_file()
 DATA.setdefault("drafts", {})
 DATA.setdefault("settings", {})
+DATA["schema_version"] = SCHEMA_VERSION
+DATA["next_app_id"] = max(DATA["next_app_id"], max((int(k) for k in DATA["applications"] if str(k).isdigit()), default=0) + 1)
 BACKUP_STATE: dict = _load_json_file(BACKUP_STATE_FILE, {})
 if not isinstance(BACKUP_STATE, dict):
     BACKUP_STATE = {}
@@ -381,14 +499,50 @@ def mark_dirty() -> None:
     _dirty = True
 
 
-def _atomic_write(path: str, text: str) -> None:
-    os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
-    tmp = f"{path}.tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        f.write(text)
-        f.flush()
-        os.fsync(f.fileno())
-    os.replace(tmp, path)   # a crash mid-write can never leave a half-written data file
+def _fsync_dir(folder: str) -> None:
+    try:
+        fd = os.open(folder, os.O_RDONLY)
+    except OSError:
+        return                       # not supported here (e.g. Windows) — the file itself was already fsynced
+    try:
+        os.fsync(fd)
+    except OSError:
+        pass
+    finally:
+        os.close(fd)
+
+
+def _atomic_write(path: str, text: str, keep_backup: bool = False) -> None:
+    """Writes to a temporary file in the same folder, flushes it to disk, then swaps it in with os.replace — a crash or a
+    full disk can never leave a half-written file. keep_backup: the file being replaced is first kept as <path>.bak
+    (itself written atomically), so there is always one previous good copy."""
+    path = os.path.abspath(path)
+    folder = os.path.dirname(path)
+    os.makedirs(folder, exist_ok=True)
+    tmp = f"{path}.{os.getpid()}.tmp"
+    try:
+        with open(tmp, "w", encoding="utf-8") as f:
+            f.write(text)
+            f.flush()
+            os.fsync(f.fileno())
+        if keep_backup and os.path.exists(path):
+            try:
+                shutil.copyfile(path, f"{path}.bak.{os.getpid()}.tmp")
+                os.replace(f"{path}.bak.{os.getpid()}.tmp", f"{path}.bak")
+            except OSError as e:
+                log.warning("Couldn't refresh %s.bak: %s", path, e)
+                try:
+                    os.remove(f"{path}.bak.{os.getpid()}.tmp")
+                except OSError:
+                    pass
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+        raise
+    _fsync_dir(folder)               # make the rename itself durable
 
 
 async def save_data() -> None:
@@ -399,7 +553,7 @@ async def save_data() -> None:
         _dirty = False
         text = json.dumps(DATA, ensure_ascii=False)
         try:
-            await asyncio.to_thread(_atomic_write, DATA_FILE, text)
+            await asyncio.to_thread(_atomic_write, DATA_FILE, text, True)
         except Exception:
             _dirty = True
             raise
@@ -598,11 +752,21 @@ def _backup_filename() -> str:
 
 
 def _build_backup_zip() -> bytes:
+    """Two members: the data, and a manifest (schema version, SHA-256 of the data, record counts) used to verify it on restore.
+    Fixed timestamps and no clock inside, so the same data always gives the same bytes (an unchanged backup is skipped)."""
+    data_bytes = json.dumps(DATA, ensure_ascii=False, sort_keys=True).encode("utf-8")
+    manifest = {
+        "format": 1, "schema_version": SCHEMA_VERSION, "sha256": hashlib.sha256(data_bytes).hexdigest(),
+        "users": len(DATA["users"]), "applications": len(DATA["applications"]), "drafts": len(DATA["drafts"]),
+        "next_app_id": DATA["next_app_id"],
+    }
     buf = BytesIO()
     with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
-        zi = zipfile.ZipInfo(BACKUP_JSON_NAME, date_time=(2020, 1, 1, 0, 0, 0))   # fixed time: same data -> same bytes
-        zi.compress_type = zipfile.ZIP_DEFLATED
-        zf.writestr(zi, json.dumps(DATA, ensure_ascii=False, sort_keys=True))
+        for name, payload in ((BACKUP_JSON_NAME, data_bytes),
+                              (BACKUP_MANIFEST_NAME, json.dumps(manifest, sort_keys=True).encode("utf-8"))):
+            zi = zipfile.ZipInfo(name, date_time=(2020, 1, 1, 0, 0, 0))
+            zi.compress_type = zipfile.ZIP_DEFLATED
+            zf.writestr(zi, payload)
     return buf.getvalue()
 
 
@@ -637,6 +801,15 @@ async def backup_to_storage(context, force: bool = False, repair: bool = False) 
         _last_backup_at = now
         gen = _data_gen
         raw = _build_backup_zip()
+        try:
+            _parse_backup(raw)       # never upload something we couldn't restore ourselves
+        except Exception as e:
+            log.error("BACKUP NOT UPLOADED — the freshly built backup failed its own check: %s", e)
+            _backup_pending = True
+            _backup_fail_streak += 1
+            if _backup_fail_streak >= BACKUP_ALERT_AFTER:
+                await alert_admins(context.bot, "backup_selfcheck", f"⚠️ النسخة الاحتياطية اتبنت بس فشلت في الفحص الذاتي ومترفعتش:\n{e}")
+            return False
         digest = hashlib.sha1(raw).hexdigest()
         if not repair and digest == _last_hash:
             _backup_pending = _data_gen != gen
@@ -680,19 +853,61 @@ async def backup_to_storage(context, force: bool = False, repair: bool = False) 
         return True
 
 
-class _BadBackup(Exception):
-    pass
-
-
 def _parse_backup(raw: bytes) -> dict:
+    """Opens a backup and rejects anything damaged, cut off, tampered with, oversized or from a newer version. Backups made
+    before the manifest existed are still accepted if everything else checks out. Returns the data, migrated to this version."""
+    if not raw:
+        raise _BadBackup("the backup file is empty")
     if not zipfile.is_zipfile(BytesIO(raw)):
         raise _BadBackup("the pinned document isn't a zip")
-    with zipfile.ZipFile(BytesIO(raw)) as zf:
-        if BACKUP_JSON_NAME not in zf.namelist():
-            raise _BadBackup(f"the zip has no {BACKUP_JSON_NAME}")
-        payload = json.loads(zf.read(BACKUP_JSON_NAME).decode("utf-8"))
+    try:
+        with zipfile.ZipFile(BytesIO(raw)) as zf:
+            bad = zf.testzip()                       # re-reads every member and checks its CRC
+            if bad is not None:
+                raise _BadBackup(f"the zip is damaged (CRC error in {bad})")
+            names = zf.namelist()
+            if BACKUP_JSON_NAME not in names:
+                raise _BadBackup(f"the zip has no {BACKUP_JSON_NAME}")
+            if zf.getinfo(BACKUP_JSON_NAME).file_size > MAX_BACKUP_BYTES:
+                raise _BadBackup("the backup is bigger than the allowed size")
+            data_bytes = zf.read(BACKUP_JSON_NAME)
+            manifest_bytes = zf.read(BACKUP_MANIFEST_NAME) if BACKUP_MANIFEST_NAME in names else None
+    except _BadBackup:
+        raise
+    except Exception as e:                           # BadZipFile, zlib errors, truncated archive...
+        raise _BadBackup(f"the zip can't be read ({e})")
+    try:
+        payload = json.loads(data_bytes.decode("utf-8"))
+    except Exception as e:
+        raise _BadBackup(f"the data isn't valid JSON — probably cut off ({e})")
+    if not isinstance(payload, dict):
+        raise _BadBackup("the data isn't a JSON object")
+    if manifest_bytes is None:
+        log.warning("Backup has no manifest (made by an older version) — checked structure only.")
+    else:
+        try:
+            manifest = json.loads(manifest_bytes.decode("utf-8"))
+        except Exception as e:
+            raise _BadBackup(f"the manifest can't be read ({e})")
+        if not isinstance(manifest, dict):
+            raise _BadBackup("the manifest isn't a JSON object")
+        mv = manifest.get("schema_version")
+        if isinstance(mv, bool) or not isinstance(mv, int):
+            raise _BadBackup("the manifest has no valid schema_version")
+        if mv > SCHEMA_VERSION:
+            raise _BadBackup(f"made by a newer version of the bot (schema {mv}; this version understands up to {SCHEMA_VERSION})")
+        if manifest.get("sha256") != hashlib.sha256(data_bytes).hexdigest():
+            raise _BadBackup("checksum mismatch — the backup is damaged or was modified")
+        if payload.get("schema_version", 0) != mv:
+            raise _BadBackup("the data and the manifest disagree about the version")
+        for key in ("users", "applications", "drafts"):
+            have = payload.get(key)
+            if not isinstance(have, dict) or manifest.get(key) != len(have):
+                raise _BadBackup(f"incomplete backup — the number of {key} doesn't match the manifest")
+    _check_version(payload)
+    payload = _migrate(payload)
     if not _valid_data(payload):
-        raise _BadBackup("unexpected structure inside the backup")
+        raise _BadBackup("unexpected or incomplete structure inside the backup")
     return payload
 
 
@@ -737,8 +952,13 @@ async def restore_from_storage(bot) -> str:
             if not pinned or not pinned.document or (pinned.caption or "") != BACKUP_MARKER:
                 RESTORE_OK = True
                 return "no_backup"
+            size = pinned.document.file_size or 0
+            if size > MAX_BACKUP_BYTES:
+                raise _BadBackup("the pinned backup is bigger than the allowed size")
             tg_file = await bot.get_file(pinned.document.file_id)
             raw = bytes(await tg_file.download_as_bytearray())
+            if size and len(raw) != size:        # a network problem, not a bad backup: the loop below retries
+                raise IOError(f"incomplete download ({len(raw)} of {size} bytes)")
             payload = _parse_backup(raw)
             _merge_data(payload)
             await save_data()
@@ -876,11 +1096,11 @@ async def _show(context: ContextTypes.DEFAULT_TYPE, chat_id: int, text: str, kb,
                     return edit.message_id
             except Exception:
                 pass   # fall back to a fresh message
-        else:
-            try:
-                await context.bot.delete_message(chat_id, edit.message_id)
-            except Exception:
-                pass
+        # couldn't turn it into the new screen (or it's a photo message): remove the old one, send fresh
+        try:
+            await context.bot.delete_message(chat_id, edit.message_id)
+        except Exception:
+            pass
     msg = await context.bot.send_message(chat_id, text, parse_mode=ParseMode.HTML,
                                          reply_markup=kb, link_preview_options=NO_PREVIEW)
     return msg.message_id
@@ -909,18 +1129,115 @@ async def send_welcome(context: ContextTypes.DEFAULT_TYPE, chat_id: int, edit=No
     context.user_data["form"]["prompt_id"] = await _show(context, chat_id, text, kb, edit)
 
 
-async def play_onboarding(context: ContextTypes.DEFAULT_TYPE, chat_id: int) -> None:
-    """The very first /start a person ever sends: SEMISENIOR spelled out, one ASCII letter per message."""
-    for i, letter in enumerate(ONBOARDING_WORD):
-        art = "\n".join(ASCII_LETTERS[letter])
-        try:
-            await context.bot.send_message(chat_id, f"<pre>{art}</pre>", parse_mode=ParseMode.HTML)
-        except Exception as e:
-            log.error("Onboarding stopped at letter %s: %s", letter, e)
-            return
-        if i < len(ONBOARDING_WORD) - 1:
-            await asyncio.sleep(ONBOARDING_DELAY)
-    await asyncio.sleep(ONBOARDING_DELAY)
+def _shadow_rows(rows: list) -> list:
+    h, w = len(rows), max(len(r) for r in rows)
+    g = [r.ljust(w) for r in rows]
+    out = []
+    for r in range(h + 1):
+        line = ""
+        for c in range(w + 1):
+            on = r < h and c < w and g[r][c] == "#"
+            sh = r > 0 and c > 0 and g[r - 1][c - 1] == "#"
+            line += "█" if on else ("░" if sh else " ")
+        out.append(line)
+    return out
+
+
+def _style_rows(rows: list, style: str) -> list:
+    if style == "shadow":
+        return _shadow_rows(rows)
+    fill = INTRO_STYLES[style][1]
+    return [r.replace("#", fill) for r in rows]
+
+
+def _render_letter(letter: str, style: str) -> str:
+    return "\n".join(r.rstrip() for r in _style_rows(ASCII_LETTERS[letter], style))
+
+
+def _render_word(word: str, style: str) -> str:
+    glyphs = []
+    for ch in word:
+        g = _style_rows(ASCII_SMALL[ch], style)
+        w = max(len(r) for r in g)
+        glyphs.append([r.ljust(w) for r in g])
+    gap = "" if style == "shadow" else " "          # a shadow glyph already carries its own spacing column
+    return "\n".join(gap.join(g[i] for g in glyphs).rstrip() for i in range(len(glyphs[0])))
+
+
+def _fade(art: str, ch: str) -> str:
+    return "".join(c if c in " \n" else ch for c in art)
+
+
+def _pre(art: str) -> str:
+    return f"<pre>{art}</pre>"
+
+
+def _intro_cfg():
+    """-> (style, mode), or None when the admins switched the intro off."""
+    cfg = DATA["settings"].get("intro")
+    if cfg is None:
+        return INTRO_DEFAULT
+    if cfg.get("off"):
+        return None
+    if cfg.get("style") in INTRO_STYLES and cfg.get("mode") in INTRO_MODES:
+        return cfg["style"], cfg["mode"]
+    return INTRO_DEFAULT
+
+
+async def play_intro(context, chat_id: int, style: str, mode: str, sent=None):
+    """Plays one intro (style x mode), then the dots. Returns the dots message — the caller turns it into the welcome
+    screen — or None if something went wrong. `sent` collects the ids of the messages that stay in the chat."""
+    async def send(text):
+        msg = await context.bot.send_message(chat_id, text, parse_mode=ParseMode.HTML)
+        if sent is not None:
+            sent.append(msg.message_id)
+        return msg
+
+    async def edit(msg, text):
+        await context.bot.edit_message_text(text, chat_id=chat_id, message_id=msg.message_id, parse_mode=ParseMode.HTML)
+
+    try:
+        if mode == "letters":                                  # 1: one letter per message
+            for letter in ONBOARDING_WORD:
+                await send(_pre(_render_letter(letter, style)))
+                await asyncio.sleep(ONBOARDING_DELAY)
+        elif mode == "words":                                  # 2: SEMI, then SENIOR
+            await send(_pre(_render_word("SEMI", style)))
+            await asyncio.sleep(INTRO_WORD_DELAY)
+            await send(_pre(_render_word("SENIOR", style)))
+            await asyncio.sleep(INTRO_WORD_DELAY)
+        else:                                                  # 3: SEMI is edited into SENIOR, stays, fades out
+            msg = await send(_pre(_render_word("SEMI", style)))
+            await asyncio.sleep(INTRO_MORPH_FIRST)
+            art = _render_word("SENIOR", style)
+            await edit(msg, _pre(art))
+            await asyncio.sleep(INTRO_HOLD)
+            for shade in "▓▒░·":
+                await edit(msg, _pre(_fade(art, shade)))
+                await asyncio.sleep(INTRO_FADE_DELAY)
+            try:
+                await context.bot.delete_message(chat_id, msg.message_id)
+            except Exception:
+                pass
+            if sent is not None and msg.message_id in sent:
+                sent.remove(msg.message_id)
+        dots = await send(".")                                 # then: . → . . → . . .
+        for text in (". .", ". . ."):
+            await asyncio.sleep(INTRO_DOT_DELAY)
+            await edit(dots, text)
+        await asyncio.sleep(INTRO_DOT_DELAY)
+        return dots
+    except Exception as e:
+        log.error("Intro stopped (%s/%s): %s", style, mode, e)
+        return None
+
+
+async def play_onboarding(context, chat_id: int):
+    """The intro the admins picked with /intro (or the default). Returns the dots message, or None."""
+    cfg = _intro_cfg()
+    if cfg is None:
+        return None
+    return await play_intro(context, chat_id, *cfg)
 
 
 def _prompt(step: str, data: dict, tg_username=None):
@@ -959,8 +1276,26 @@ def _confirm_kb() -> InlineKeyboardMarkup:
     ])
 
 
+async def _delete_messages(context: ContextTypes.DEFAULT_TYPE, chat_id: int, ids) -> None:
+    for mid in ids:
+        try:
+            await context.bot.delete_message(chat_id, mid)
+        except Exception:
+            pass   # already gone / too old — nothing to do
+
+
+async def _warn(context: ContextTypes.DEFAULT_TYPE, msg, text: str) -> None:
+    """Reply to a wrong/unwanted input. Both the input and this reply are remembered and deleted
+    as soon as the student gives a valid answer (or moves on), so nothing is left over."""
+    sent = await msg.reply_text(text)
+    form = _form(context)
+    if form is not None:
+        form.setdefault("junk", []).extend([msg.message_id, sent.message_id])
+
+
 async def ask(context: ContextTypes.DEFAULT_TYPE, chat_id: int, step: str, edit=None) -> None:
     form = _form(context)
+    await _delete_messages(context, chat_id, form.pop("junk", None) or [])   # warnings from the previous step
     form["step"] = step
     if step == "confirm":
         data = form["data"]
@@ -982,10 +1317,13 @@ async def ask(context: ContextTypes.DEFAULT_TYPE, chat_id: int, step: str, edit=
         form["prompt_id"] = await _show(context, chat_id, text, kb, edit)
 
 
-async def go_next(context: ContextTypes.DEFAULT_TYPE, chat_id: int, edit=None) -> None:
+async def go_next(context: ContextTypes.DEFAULT_TYPE, chat_id: int, edit=None, entry_msg=None) -> None:
     form = _form(context)
-    if edit is None:                       # the answer came as a typed message: close the old question's buttons
-        await _clear_prompt_buttons(context, chat_id)
+    if edit is None and form.get("prompt_id"):
+        # the answer came as a typed message: the old question is turned INTO the next screen (no leftover)
+        edit = SimpleNamespace(text=True, message_id=form["prompt_id"])
+    if DELETE_USER_ENTRIES and entry_msg is not None:
+        await _delete_messages(context, chat_id, [entry_msg.message_id])
     if form.pop("edit_mode", None):        # fixing one answer from the summary: straight back to the summary
         nxt = "confirm"
     else:
@@ -1006,6 +1344,8 @@ def _status_payload(user_id: int):
     ]
     rows = [[InlineKeyboardButton(f"{RESEND_BTN} #{a['id']}", callback_data=f"rs:{a['id']}")]
             for a in apps if a["status"] == "rejected" and a.get("can_resend")]
+    rows += [[InlineKeyboardButton(f"{EDIT_BTN} #{a['id']}", callback_data=f"ea:{a['id']}")]
+             for a in apps if a["status"] in EDITABLE_STATUSES]
     return f"🔎 <b>حالة طلباتك</b>\n{LINE}\n" + "\n\n".join(blocks), rows
 
 
@@ -1028,9 +1368,22 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             await commit()
     except Exception:
         log.exception("Couldn't save the user")   # never block the form because of a save problem
-    if is_new:
-        await play_onboarding(context, chat_id)
-    await send_welcome(context, chat_id)
+    dots = await play_onboarding(context, chat_id) if (is_new or INTRO_EVERY_START) else None
+    if dots is not None and not DATA["settings"].get("welcome_photo_id"):
+        await send_welcome(context, chat_id, edit=dots)      # the dots message itself becomes the welcome screen
+    else:
+        if dots is not None:
+            try:
+                await context.bot.delete_message(chat_id, dots.message_id)
+            except Exception:
+                pass
+        await send_welcome(context, chat_id)
+    if _is_admin(user):          # this admin may have been unreachable before (never pressed /start): catch up now
+        try:
+            await retry_failed_notifications(context, only_admin=user.id, min_age=0)
+            await retry_edit_notices(context, only_admin=user.id, min_age=0)
+        except Exception:
+            log.exception("Catch-up of admin notifications failed")
 
 
 @serialized
@@ -1095,8 +1448,49 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         await ask(context, chat_id, "name", q.message)   # the welcome message turns into the first question
         return
 
+    if data.startswith("ea:"):                                  # "request a correction": which answer?
+        rec = DATA["applications"].get(data[3:])
+        if not (rec and rec["user_id"] == chat_id and rec["status"] in EDITABLE_STATUSES):
+            await q.answer("التعديل مش متاح دلوقتي", show_alert=True)
+            return
+        await q.answer()
+        await _show_editpick(context, chat_id, rec, q.message)
+        return
+    if data.startswith("ef:"):                                  # a field was chosen: ask for the new value
+        parts = data.split(":")
+        rec = DATA["applications"].get(parts[1]) if len(parts) == 3 else None
+        field = parts[2] if len(parts) == 3 else ""
+        if not (rec and rec["user_id"] == chat_id and rec["status"] in EDITABLE_STATUSES and field in QUESTION_STEPS):
+            await q.answer("التعديل مش متاح دلوقتي", show_alert=True)
+            return
+        if len(rec.get("edits") or []) >= MAX_EDITS_PER_APP:
+            await q.answer(_EDIT_ERRORS["limit"], show_alert=True)
+            return
+        await q.answer()
+        context.user_data["form"] = _new_form("editval", app_id=rec["id"], field=field)
+        text, kb = _edit_prompt(rec, field)
+        context.user_data["form"]["prompt_id"] = await _show(context, chat_id, text, kb, q.message)
+        return
+    if data == "eback":                                         # from the field list back to the status screen
+        await q.answer()
+        text, rows = _status_payload(chat_id)
+        kb = InlineKeyboardMarkup([*rows, [InlineKeyboardButton(BACK_BTN, callback_data="home")]])
+        context.user_data["form"] = _new_form("status")
+        context.user_data["form"]["prompt_id"] = await _show(context, chat_id, text, kb, q.message)
+        return
+
     if not form:
         await q.answer("الجلسة انتهت، ابعت /start من جديد 🙏", show_alert=True)
+        return
+
+    if data.startswith("ev:"):                                  # a button answer (item / size / pack) for a correction
+        field = form.get("field")
+        options = {"item": ITEMS, "size": SIZES, "pack": PACK_ORDER}.get(field)
+        idx = data[3:]
+        if form["step"] != "editval" or options is None or not idx.isdigit() or int(idx) >= len(options):
+            await q.answer("السؤال ده قديم", show_alert=False)
+            return
+        await _finish_edit(context, chat_id, form, None, field, options[int(idx)], q=q)
         return
 
     if data.startswith("back:"):
@@ -1207,16 +1601,23 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
     step, text = form["step"], msg.text or ""
 
+    if step == "editpick":
+        await _warn(context, msg, "اختار من الأزرار اللي تحت 👇")
+        return
+    if step == "editval":
+        await _handle_edit_text(context, chat_id, form, msg, text)
+        return
+
     if step == "name":
         value = clean_name(text)
         if not value:
-            await msg.reply_text("ابعت اسمك الكامل (على الأقل اسمك واسم أبوك) 🙏")
+            await _warn(context, msg, "ابعت اسمك الكامل (على الأقل اسمك واسم أبوك) 🙏")
             return
         form["data"]["name"] = value
     elif step == "username":
         value = clean_username(text)
         if not value:
-            await msg.reply_text(
+            await _warn(context, msg,
                 "اليوزر مش مظبوط 🙏\nلازم يبقى حروف إنجليزي وأرقام و _ (من 5 لـ 32 حرف). ابعته تاني."
             )
             return
@@ -1224,23 +1625,23 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     elif step == "phone":
         value = clean_phone(text)
         if not value:
-            await msg.reply_text("الرقم مش مظبوط 🙏 ابعته تاني (أرقام بس).")
+            await _warn(context, msg, "الرقم مش مظبوط 🙏 ابعته تاني (أرقام بس).")
             return
         if BLOCK_DUPLICATE_PHONE and (dup := _find_dup_phone(value)):
-            await msg.reply_text(f"الرقم ده عليه طلب مسجل بالفعل (#{dup['id']}) 🙏\nلو محتاج تعدّل أو تحجز حاجة تانية كلّم الإدارة.")
+            await _warn(context, msg, f"الرقم ده عليه طلب مسجل بالفعل (#{dup['id']}) 🙏\nلو محتاج تعدّل أو تحجز حاجة تانية كلّم الإدارة.")
             return
         form["data"]["phone"] = value
-    elif step in ("item", "size"):
-        await msg.reply_text("اختار من الأزرار اللي تحت 👇")
+    elif step in ("item", "size", "pack"):
+        await _warn(context, msg, "اختار من الأزرار اللي تحت 👇")
         return
     elif step in ("photo", "resend"):
-        await msg.reply_text("الصورة بس هي المقبولة هنا 🙏 ابعت صورة/سكرين شوت التحويل.")
+        await _warn(context, msg, "الصورة بس هي المقبولة هنا 🙏 ابعت صورة/سكرين شوت التحويل.")
         return
     else:  # confirm
-        await msg.reply_text("اضغط على أحد الأزرار اللي فوق 👆")
+        await _warn(context, msg, "اضغط على أحد الأزرار اللي فوق 👆")
         return
 
-    await go_next(context, chat_id)
+    await go_next(context, chat_id, entry_msg=msg)
 
 
 async def _edit_text_by_id(context, chat_id: int, message_id: int, text: str, kb=None) -> None:
@@ -1264,7 +1665,7 @@ async def _handle_resend_photo(context, chat_id: int, form: dict, msg, kind: str
             await msg.reply_text("الطلب ده مش محتاج صورة جديدة دلوقتي.")
             return
         if BLOCK_DUPLICATE_PHOTO and _find_dup_photo(uid):
-            await msg.reply_text("الصورة دي اتبعتت قبل كده 🙏 ابعت صورة التحويل الجديدة الخاصة بيك.")
+            await _warn(context, msg, "الصورة دي اتبعتت قبل كده 🙏 ابعت صورة التحويل الجديدة الخاصة بيك.")
             return
         rec["history"].append({"status": "rejected", "reason": rec.get("reject_reason"),
                                "by": rec.get("decided_by"), "at": rec.get("decided_at")})
@@ -1276,6 +1677,9 @@ async def _handle_resend_photo(context, chat_id: int, form: dict, msg, kind: str
         except Exception:
             log.exception("Couldn't save the new screenshot for #%s", sid)
     prompt_id = form.get("prompt_id")
+    await _delete_messages(context, chat_id, form.pop("junk", None) or [])
+    if DELETE_USER_ENTRIES:
+        await _delete_messages(context, chat_id, [msg.message_id])
     context.user_data.pop("form", None)
     done = f"✅ وصلتنا الصورة الجديدة لطلب #{rec['id']}\nهنراجعها ونبلغك ❤️‍🔥"
     if prompt_id:
@@ -1296,22 +1700,25 @@ async def on_image(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not form or form["step"] in ("welcome", "done", "status"):
         await send_welcome(context, chat_id)
         return
-    if form["step"] not in ("photo", "resend"):
-        await msg.reply_text("الصورة مش مطلوبة دلوقتي، جاوب على السؤال اللي فوق 🙏")
+    if form["step"] not in ("photo", "resend") and not (form["step"] == "editval" and form.get("field") == "photo"):
+        await _warn(context, msg, "الصورة مش مطلوبة دلوقتي، جاوب على السؤال اللي فوق 🙏")
         return
 
     if msg.photo:
         kind, fid, uid = "photo", msg.photo[-1].file_id, msg.photo[-1].file_unique_id
     else:
         kind, fid, uid = "document", msg.document.file_id, msg.document.file_unique_id
+    if form["step"] == "editval":
+        await _finish_edit(context, chat_id, form, msg, "photo", None, photo=(kind, fid, uid))
+        return
     if form["step"] == "resend":
         await _handle_resend_photo(context, chat_id, form, msg, kind, fid, uid)
         return
     if BLOCK_DUPLICATE_PHOTO and (dup := _find_dup_photo(uid)):
-        await msg.reply_text("الصورة دي اتبعتت قبل كده في طلب تاني 🙏\nابعت صورة التحويل الخاصة بيك.")
+        await _warn(context, msg, "الصورة دي اتبعتت قبل كده في طلب تاني 🙏\nابعت صورة التحويل الخاصة بيك.")
         return
     form["data"].update(photo_kind=kind, photo_id=fid, photo_uid=uid)
-    await go_next(context, chat_id)
+    await go_next(context, chat_id, entry_msg=msg)
 
 
 @serialized
@@ -1321,10 +1728,10 @@ async def on_other(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     chat_id = update.effective_chat.id
     if not form or form["step"] in ("welcome", "done", "status"):
         await send_welcome(context, chat_id)
-    elif form["step"] in ("photo", "resend"):
-        await update.message.reply_text("الصورة بس هي المقبولة هنا 🙏 ابعت صورة/سكرين شوت التحويل.")
+    elif form["step"] in ("photo", "resend") or (form["step"] == "editval" and form.get("field") == "photo"):
+        await _warn(context, update.message, "الصورة بس هي المقبولة هنا 🙏 ابعت صورة/سكرين شوت التحويل.")
     else:
-        await update.message.reply_text("جاوب على السؤال اللي فوق 🙏")
+        await _warn(context, update.message, "جاوب على السؤال اللي فوق 🙏")
 
 
 # ── Admin side ────────────────────────────────────────────────────────────────
@@ -1340,6 +1747,7 @@ def _admin_caption_ex(rec: dict, title: str, footer: str = "", warn: bool = True
         f"{title} #{rec['id']}\n{LINE}\n{_fields_html(rec)}\n{LINE}\n"
         f'🆔 <a href="tg://user?id={rec["user_id"]}">{_esc(rec.get("tg_full_name") or rec["user_id"])}</a>{acct}\n'
         f"🕒 {_fmt_time(rec['created_at'])}"
+        + (f"\n✏️ اتعدل {len(rec['edits'])} مرة" if warn and rec.get("edits") else "")
     )
     total = len(_photo_matches(rec)) if (warn and WARN_DUPLICATE_PHOTO) else 0
     n = min(total, WARN_MAX_PEOPLE)
@@ -1390,15 +1798,15 @@ async def _send_card(bot, chat_id: int, rec: dict, caption: str, markup):
     return await bot.send_document(chat_id, rec["photo_id"], caption=caption, parse_mode=ParseMode.HTML, reply_markup=markup)
 
 
-async def notify_admins(context, rec: dict, resubmitted: bool = False) -> None:
+async def notify_admins(context, rec: dict, resubmitted: bool = False, only=None) -> None:
     """DMs the application to every admin with [قبول]/[رفض]. Nothing goes to the results group yet."""
     if not ADMIN_IDS:
         log.warning("ADMIN_IDS is empty — application #%s is saved as pending but nobody was notified.", rec["id"])
         return
     title = "🔁 <b>صورة جديدة لطلب</b>" if resubmitted else "📥 <b>طلب حجز جديد</b>"
-    if resubmitted:
+    if resubmitted and only is None:
         rec["admin_msgs"] = {}
-    for admin_id in sorted(ADMIN_IDS):
+    for admin_id in (sorted(ADMIN_IDS) if only is None else sorted(only)):
         try:
             text, truncated = _admin_caption_ex(rec, title, pointer=True)
             sent = await _send_card(context.bot, admin_id, rec, text, _review_kb(rec))
@@ -1407,6 +1815,7 @@ async def notify_admins(context, rec: dict, resubmitted: bool = False) -> None:
                 await _send_dup_details(context.bot, admin_id, rec, sent.message_id)
         except Exception as e:
             log.error("Couldn't notify admin %s about #%s (has the admin pressed /start?): %s", admin_id, rec["id"], e)
+    rec["notify_failed"] = _missing_admins(rec)      # who still has no card (retried by housekeeping, /retry, or their /start)
     try:
         await commit()
     except Exception:
@@ -1417,26 +1826,48 @@ async def _post_to_group(context, rec: dict):
     return await _send_card(context.bot, GROUP_ID, rec, _admin_caption(rec, "✅ <b>حجز مقبول</b>", warn=False), None)
 
 
-async def _refresh_admin_cards(context, rec: dict) -> None:
-    caption = _admin_caption(rec, "📥 <b>طلب حجز</b>", _decision_footer(rec))
-    for admin_id, msg_id in (rec.get("admin_msgs") or {}).items():
+def _input_media(rec: dict, caption: str):
+    cls = InputMediaPhoto if rec["photo_kind"] == "photo" else InputMediaDocument
+    return cls(media=rec["photo_id"], caption=caption, parse_mode=ParseMode.HTML)
+
+
+async def _edit_card(bot, chat_id, message_id, rec: dict, caption: str, markup, new_media: bool = False) -> None:
+    """Edits a card's caption — and, after a screenshot change, its picture too."""
+    if new_media:
         try:
-            await context.bot.edit_message_caption(chat_id=int(admin_id), message_id=msg_id, caption=caption,
-                                                   parse_mode=ParseMode.HTML, reply_markup=None)
-        except Exception:
-            pass   # message deleted / unchanged — nothing to do
+            await bot.edit_message_media(chat_id=chat_id, message_id=message_id, media=_input_media(rec, caption),
+                                         reply_markup=markup)
+            return
+        except Exception as e:
+            log.warning("Couldn't swap the picture on message %s: %s", message_id, e)
+    try:
+        await bot.edit_message_caption(chat_id=chat_id, message_id=message_id, caption=caption,
+                                       parse_mode=ParseMode.HTML, reply_markup=markup)
+    except Exception:
+        pass   # message deleted / unchanged — nothing to do
 
 
-async def _refresh_user_card(context, rec: dict) -> None:
+async def _refresh_admin_cards(context, rec: dict, keep_buttons: bool = False, new_media: bool = False) -> None:
+    caption = _admin_caption(rec, "📥 <b>طلب حجز</b>", _decision_footer(rec))
+    markup = _review_kb(rec) if (keep_buttons and rec["status"] == "pending") else None
+    for admin_id, msg_id in (rec.get("admin_msgs") or {}).items():
+        await _edit_card(context.bot, int(admin_id), msg_id, rec, caption, markup, new_media)
+
+
+async def _refresh_user_card(context, rec: dict, new_media: bool = False) -> None:
     """The student's own receipt message follows the application: ⏳ -> ✅ / ❌ (edited in place)."""
     if not rec.get("user_msg_id"):
         return
     caption = _receipt(rec, f"طلب الحجز #{rec['id']}", _status_line(rec))
-    try:
-        await context.bot.edit_message_caption(chat_id=rec["user_id"], message_id=rec["user_msg_id"], caption=caption,
-                                               parse_mode=ParseMode.HTML, reply_markup=None)
-    except Exception:
-        pass
+    await _edit_card(context.bot, rec["user_id"], rec["user_msg_id"], rec, caption, None, new_media)
+
+
+async def _refresh_group_post(context, rec: dict, new_media: bool = False) -> None:
+    """An accepted application that was corrected afterwards: the post in the results group follows it."""
+    if rec["status"] != "accepted" or not rec.get("group_msg_id"):
+        return
+    caption = _admin_caption(rec, "✅ <b>حجز مقبول</b>", warn=False)
+    await _edit_card(context.bot, GROUP_ID, rec["group_msg_id"], rec, caption, None, new_media)
 
 
 @serialized
@@ -1761,9 +2192,483 @@ async def cmd_clearwelcome(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     await update.message.reply_text("✅ اتشالت صورة الترحيب.")
 
 
+# ── /intro: pick the ASCII intro everybody sees ──────────────────────────────
+def _intro_current_text() -> str:
+    cfg = _intro_cfg()
+    if cfg is None:
+        return "🚫 مقفول (من غير إنترو)"
+    return f"{INTRO_STYLES[cfg[0]][0]} — {INTRO_MODES[cfg[1]]}"
+
+
+def _intro_home_payload():
+    when = "في كل /start" if INTRO_EVERY_START else "لأي حد يدوس /start لأول مرة"
+    text = f"🎬 <b>الإنترو</b>\nالحالي: {_intro_current_text()}\nبيظهر {when}.\n\nاختار الشكل 👇"
+    btns = [InlineKeyboardButton(lab, callback_data=f"intro:s:{k}") for k, (lab, _f) in INTRO_STYLES.items()]
+    rows = [btns[i:i + 2] for i in range(0, len(btns), 2)]
+    rows.append([InlineKeyboardButton("🚫 من غير إنترو", callback_data="intro:off")])
+    return text, InlineKeyboardMarkup(rows)
+
+
+@admin_only
+async def cmd_intro(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    text, kb = _intro_home_payload()
+    await update.message.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=kb)
+
+
+async def _delete_intro_previews(context, chat_id: int, keep=None) -> None:
+    ids = [i for i in (context.user_data.pop("intro_preview", None) or []) if i != keep]
+    await _delete_messages(context, chat_id, ids)
+
+
+@serialized
+async def on_intro_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    q = update.callback_query
+    if not _is_admin(q.from_user):
+        await q.answer("مش مسموحلك تعمل كده", show_alert=True)
+        return
+    chat_id = q.from_user.id
+    parts = (q.data or "").split(":")
+    action = parts[1] if len(parts) > 1 else ""
+    style = parts[2] if len(parts) > 2 else None
+    mode = parts[3] if len(parts) > 3 else None
+    if (action in ("s", "m", "set") and style not in INTRO_STYLES) or (action in ("m", "set") and mode not in INTRO_MODES):
+        await q.answer("الزرار ده قديم", show_alert=False)
+        return
+
+    if action == "home":
+        await q.answer()
+        await _delete_intro_previews(context, chat_id, keep=q.message.message_id)
+        text, kb = _intro_home_payload()
+        await _show(context, chat_id, text, kb, q.message)
+    elif action == "s":                                              # style chosen -> which mode?
+        await q.answer()
+        await _delete_intro_previews(context, chat_id, keep=q.message.message_id)
+        rows = [[InlineKeyboardButton(lab, callback_data=f"intro:m:{style}:{m}")] for m, lab in INTRO_MODES.items()]
+        rows.append([InlineKeyboardButton(BACK_BTN, callback_data="intro:home")])
+        await _show(context, chat_id, f"🎬 <b>{INTRO_STYLES[style][0]}</b>\nاختار الطريقة 👇", InlineKeyboardMarkup(rows), q.message)
+    elif action == "m":                                              # mode chosen -> play it here as a preview
+        await q.answer("▶️ بشغّل المعاينة…")
+        await _delete_intro_previews(context, chat_id)
+        try:
+            await context.bot.delete_message(chat_id, q.message.message_id)
+        except Exception:
+            pass
+        sent: list = []
+        context.user_data["intro_preview"] = sent
+        dots = await play_intro(context, chat_id, style, mode, sent)
+        text = f"🎬 {INTRO_STYLES[style][0]} — {INTRO_MODES[mode]}\n\nتعتمد ده للكل؟"
+        kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton("✅ اعتمد ده للكل", callback_data=f"intro:set:{style}:{mode}")],
+            [InlineKeyboardButton("🔁 شغّله تاني", callback_data=f"intro:m:{style}:{mode}")],
+            [InlineKeyboardButton(BACK_BTN, callback_data=f"intro:s:{style}")],
+        ])
+        mid = await _show(context, chat_id, text, kb, dots)          # the dots message turns into this question
+        if mid not in sent:
+            sent.append(mid)
+    elif action in ("set", "off"):
+        value = {"style": style, "mode": mode} if action == "set" else {"off": True}
+        _set_setting("intro", value)
+        try:
+            await commit()
+        except Exception:
+            log.exception("Couldn't save the intro setting")
+            await q.answer("حصلت مشكلة في الحفظ، جرب تاني 🙏", show_alert=True)
+            return
+        await q.answer("✅ اتحفظ")
+        await _delete_intro_previews(context, chat_id, keep=q.message.message_id)
+        kb = InlineKeyboardMarkup([[InlineKeyboardButton("🎬 تغيير", callback_data="intro:home")]])
+        await _show(context, chat_id, f"✅ الإنترو دلوقتي: {_intro_current_text()}", kb, q.message)
+    else:
+        await q.answer()
+
+
+# ── /search: by application number, name, phone, @username or Telegram id ─────
+SEARCH_MAX_CARDS = 5
+
+
+def _search_apps(query: str) -> list:
+    q = query.strip().lstrip("#@").strip().lower()
+    if not q:
+        return []
+    qd = re.sub(r"[\s\-+().]", "", q.translate(_DIGITS))       # "+20 101-234" -> "20101234"
+    pd = qd.lstrip("0")
+    found = []
+    for a in DATA["applications"].values():
+        texts = (a.get("name"), a.get("username"), a.get("tg_username"), a.get("tg_full_name"))
+        hit = any(q in t.lower() for t in texts if t)
+        if qd.isdigit():
+            hit = hit or str(a["id"]) == qd or str(a["user_id"]) == qd
+            if len(pd) >= 4:      # last 10 digits, so +20 1012345678 finds 01012345678 and the other way round
+                hit = hit or pd[-10:] in re.sub(r"\D", "", a.get("phone") or "")
+        if hit:
+            found.append(a)
+    return sorted(found, key=lambda a: a["id"])
+
+
+@admin_only
+async def cmd_search(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = " ".join(context.args or []).strip()
+    if not query:
+        await update.message.reply_text(
+            "🔎 البحث:\n/search رقم الطلب  (مثال: /search 12)\n/search الاسم\n/search رقم التليفون\n"
+            "/search @اليوزر\n/search ID التليجرام")
+        return
+    results = _search_apps(query)
+    if not results:
+        await update.message.reply_text("مفيش نتايج 🤷")
+        return
+    admin_id = update.effective_user.id
+    shown = results[:SEARCH_MAX_CARDS]
+    await update.message.reply_text(
+        f"🔎 لقيت {len(results)} نتيجة" + (f" — هعرض أول {SEARCH_MAX_CARDS}" if len(results) > SEARCH_MAX_CARDS else ""))
+    changed = False
+    for rec in shown:
+        try:
+            pending = rec["status"] == "pending"
+            text, truncated = _admin_caption_ex(rec, "🔎 <b>طلب</b>", _decision_footer(rec), pointer=True)
+            sent = await _send_card(context.bot, admin_id, rec, text, _review_kb(rec) if pending else None)
+            if pending:      # this card becomes the live one: the older card of this admin loses its buttons
+                old = (rec.get("admin_msgs") or {}).get(str(admin_id))
+                if old and old != sent.message_id:
+                    try:
+                        await context.bot.edit_message_reply_markup(chat_id=admin_id, message_id=old, reply_markup=None)
+                    except Exception:
+                        pass
+                rec["admin_msgs"][str(admin_id)] = sent.message_id
+                changed = True
+            if truncated:
+                await _send_dup_details(context.bot, admin_id, rec, sent.message_id)
+        except Exception as e:
+            log.error("Couldn't send search result #%s: %s", rec["id"], e)
+    if len(results) > SEARCH_MAX_CARDS:
+        rest = [f"• #{a['id']} — {_esc(a['name'])} — {_STATUS_SHORT[a['status']]}" for a in results[SEARCH_MAX_CARDS:SEARCH_MAX_CARDS + 30]]
+        more = f"\n… و{len(results) - SEARCH_MAX_CARDS - 30} كمان — دوّر بكلمة أدق" if len(results) > SEARCH_MAX_CARDS + 30 else ""
+        await update.message.reply_text("باقي النتايج (دوّر برقم الطلب عشان تشوف الكارت):\n" + "\n".join(rest) + more,
+                                        parse_mode=ParseMode.HTML)
+    if changed:
+        await commit()
+
+
+# ── Retry failed admin notifications ──────────────────────────────────────────
+def _age_seconds(iso) -> float:
+    try:
+        return (datetime.now(timezone.utc) - datetime.fromisoformat(iso)).total_seconds()
+    except Exception:
+        return 1e9
+
+
+def _missing_admins(rec: dict) -> list:
+    """Admins who have no review card for this application yet (their message failed)."""
+    got = rec.get("admin_msgs") or {}
+    return [a for a in sorted(ADMIN_IDS) if str(a) not in got]
+
+
+async def retry_failed_notifications(context, only_admin=None, min_age: float = NOTIFY_RETRY_MIN_AGE) -> int:
+    """Pending applications whose card never reached some admin are sent to just those admins. Returns how many cards went out."""
+    sent = 0
+    pending = sorted((r for r in DATA["applications"].values() if r["status"] == "pending"), key=lambda r: r["id"])
+    for rec in pending:
+        missing = _missing_admins(rec)
+        if only_admin is not None:
+            missing = [a for a in missing if a == only_admin]
+        if not missing or _age_seconds(rec.get("updated_at") or rec["created_at"]) < min_age:
+            continue
+        async with _lock_for(_app_locks, str(rec["id"])):
+            if rec["status"] != "pending":
+                continue
+            before = len(rec["admin_msgs"])
+            await notify_admins(context, rec, resubmitted=bool(rec.get("resubmits")), only=missing)
+            sent += len(rec["admin_msgs"]) - before
+    return sent
+
+
+@admin_only
+async def cmd_retry(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    n_apps = await retry_failed_notifications(context, min_age=0)
+    n_edits = await retry_edit_notices(context, min_age=0, ignore_tries=True)
+    left_apps = sum(1 for r in DATA["applications"].values() if r["status"] == "pending" and _missing_admins(r))
+    left_edits = sum(1 for r in DATA["applications"].values() for e in (r.get("edits") or []) if _edit_missing(e))
+    lines = [f"🔁 اتبعت تاني: {n_apps} طلب · {n_edits} تعديل"]
+    if left_apps or left_edits:
+        lines.append(f"⚠️ لسه واصلش: {left_apps} طلب · {left_edits} تعديل — اتأكد إن كل أدمن داس /start للبوت.")
+    else:
+        lines.append("✅ مفيش حاجة معلقة.")
+    await update.message.reply_text("\n".join(lines))
+
+
+# ── Corrections after submitting (student side) + "before vs after" to the admins ──
+_EDIT_ERRORS = {
+    "gone": "التعديل مش متاح دلوقتي",
+    "limit": "وصلت للحد الأقصى من التعديلات، كلّم الإدارة 🙏",
+    "same": "دي نفس القيمة الحالية 🙏",
+    "full": "ده خلص ❌ اختار حاجة تانية",
+    "dup_phone": "الرقم ده عليه طلب تاني مسجل 🙏 كلّم الإدارة.",
+    "dup_photo": "الصورة دي اتبعتت قبل كده 🙏 ابعت صورة التحويل الخاصة بيك.",
+    "error": "حصلت مشكلة وإحنا بنسجل التعديل، جرب تاني كمان شوية 🙏",
+}
+
+
+def _fmt_edit_value(field: str, v) -> str:
+    if v in (None, ""):
+        return "—"
+    if field == "item":
+        return _esc(_item_label(v))
+    if field == "pack":
+        p = PACKS.get(v)
+        return f"{p['emoji']} {_esc(p['name'])} — {p['price']}ج" if p else _esc(v)
+    return _esc(v)
+
+
+def _editpick_kb(rec: dict) -> InlineKeyboardMarkup:
+    b = lambda s: InlineKeyboardButton(EDIT_LABELS[s], callback_data=f"ef:{rec['id']}:{s}")
+    return InlineKeyboardMarkup([
+        [b("name"), b("username"), b("phone")],
+        [b("item"), b("size"), b("pack")],
+        [b("photo")],
+        [InlineKeyboardButton(BACK_BTN, callback_data="eback")],
+    ])
+
+
+async def _show_editpick(context, chat_id: int, rec: dict, edit=None) -> None:
+    """The "which answer do you want to correct?" screen — shared by the /status button and /edit_request."""
+    context.user_data["form"] = _new_form("editpick", app_id=rec["id"])
+    text = f"✏️ <b>تعديل طلب #{rec['id']}</b>\n{LINE}\n{_fields_html(rec)}\n{LINE}\nاختار اللي عايز تعدله 👇"
+    context.user_data["form"]["prompt_id"] = await _show(context, chat_id, text, _editpick_kb(rec), edit)
+
+
+@serialized
+async def cmd_edit_request(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/edit_request: same function as the ✏️ طلب تعديل button in /status."""
+    chat_id, user_id = update.effective_chat.id, update.effective_user.id
+    form = _form(context)
+    if form and form["step"] in QUESTION_STEPS + ["confirm"]:       # a booking is half-filled: don't wipe it
+        await update.message.reply_text("إنت في نص تعبئة الحجز 🙏 كمّله الأول، أو ابعت /start عشان تبدأ من جديد.")
+        return
+    apps = sorted((a for a in DATA["applications"].values()
+                   if a["user_id"] == user_id and a["status"] in EDITABLE_STATUSES), key=lambda a: a["id"], reverse=True)[:5]
+    if not apps:
+        await update.message.reply_text("مفيش طلب تقدر تعدّله دلوقتي 🤷\nالتعديل متاح للطلبات اللي قيد المراجعة أو المقبولة.")
+        return
+    if len(apps) == 1:                                              # only one: straight to "what do you want to change?"
+        await _show_editpick(context, chat_id, apps[0])
+        return
+    blocks = [f"🧾 <b>طلب #{a['id']}</b> — {ITEM_EMOJI.get(a['item'], '🧥')} {_esc(a['item'])} / {_esc(a['size'])}\n"
+              f"{_status_line(a)}\n🕒 {_fmt_time(a['created_at'])}" for a in apps]
+    kb = InlineKeyboardMarkup([[InlineKeyboardButton(f"{EDIT_BTN} #{a['id']}", callback_data=f"ea:{a['id']}")] for a in apps])
+    await update.message.reply_text("✏️ <b>أنهي طلب عايز تعدّله؟</b>\n" + LINE + "\n" + "\n\n".join(blocks),
+                                    parse_mode=ParseMode.HTML, reply_markup=kb)
+
+
+def _edit_prompt(rec: dict, field: str):
+    """-> (text, keyboard) asking for the new value of one answer."""
+    head = f"✏️ <b>تعديل {EDIT_LABELS[field]} — طلب #{rec['id']}</b>"
+    back = [InlineKeyboardButton(BACK_BTN, callback_data=f"ea:{rec['id']}")]
+    if field == "photo":
+        return f"{head}\n\n{Q_RESEND}", InlineKeyboardMarkup([back])
+    cur = f"الحالي: {_fmt_edit_value(field, rec.get(field))}"
+    if field in ("name", "username", "phone"):
+        return f"{head}\n{cur}\n\nابعت القيمة الجديدة 👇", InlineKeyboardMarkup([back])
+    if field == "item":
+        labels, per_row, extra = [_item_label(i) for i in ITEMS], 0, ""
+    elif field == "size":
+        labels = [("❌ " if s != rec["size"] and _is_full(rec["item"], s) else f"{SIZE_EMOJI} ") + s for s in SIZES]
+        per_row, extra = 0, f"\n\n{SIZE_NOTE}"
+    else:
+        labels, per_row, extra = [_pack_label(k) for k in PACK_ORDER], 1, f"\n\n{PACKS_TEXT}"
+    btns = [InlineKeyboardButton(lab, callback_data=f"ev:{i}") for i, lab in enumerate(labels)]
+    per_row = per_row or len(btns)
+    rows = [btns[i:i + per_row] for i in range(0, len(btns), per_row)]
+    return f"{head}\n{cur}{extra}", InlineKeyboardMarkup([*rows, back])
+
+
+async def apply_edit(chat_id: int, sid: str, field: str, value, photo=None):
+    """Applies ONE correction and saves it. -> (error code | None, rec, entry). Under the application's lock, so an admin
+    decision and a correction can't interleave; the limit check and the change happen with no await in between."""
+    async with _lock_for(_app_locks, sid):
+        rec = DATA["applications"].get(sid)
+        if not (rec and rec["user_id"] == chat_id and rec["status"] in EDITABLE_STATUSES):
+            return "gone", None, None
+        edits = rec.setdefault("edits", [])
+        if len(edits) >= MAX_EDITS_PER_APP:
+            return "limit", rec, None
+        now = _now_iso()
+        entry = {"n": len(edits) + 1, "field": field, "at": now, "by_status": rec["status"], "notified": [], "tries": 0}
+        if field == "photo":
+            kind, fid, uid = photo
+            if uid == rec.get("photo_uid"):
+                return "same", rec, None
+            if BLOCK_DUPLICATE_PHOTO and (dup := _find_dup_photo(uid)) and dup["id"] != rec["id"]:
+                return "dup_photo", rec, None
+            entry.update(before_kind=rec["photo_kind"], before_id=rec["photo_id"], after_kind=kind, after_id=fid)
+            old = {k: rec.get(k) for k in ("photo_kind", "photo_id", "photo_uid")}
+            rec.update(photo_kind=kind, photo_id=fid, photo_uid=uid)
+        else:
+            if rec.get(field) == value:
+                return "same", rec, None
+            if field == "phone" and BLOCK_DUPLICATE_PHONE and (dup := _find_dup_phone(value)) and dup["id"] != rec["id"]:
+                return "dup_phone", rec, None
+            item = value if field == "item" else rec["item"]
+            size = value if field == "size" else rec["size"]
+            if field in ("item", "size") and _is_full(item, size):
+                return "full", rec, None
+            entry.update(before=rec.get(field), after=value)
+            old = {field: rec.get(field)}
+            rec[field] = value
+        prev_updated = rec["updated_at"]
+        rec["updated_at"] = now
+        edits.append(entry)
+        try:
+            await commit()
+        except Exception:
+            edits.pop()
+            rec.update(old)
+            rec["updated_at"] = prev_updated
+            raise
+        return None, rec, entry
+
+
+def _edit_notice_text(rec: dict, entry: dict) -> str:
+    f = entry["field"]
+    acct = f" (@{_esc(rec['tg_username'])})" if rec.get("tg_username") else ""
+    if f == "photo":
+        body = "⬅️ قبل / ➡️ بعد: الصورتين تحت 👇"
+    else:
+        body = f"⬅️ قبل: {_fmt_edit_value(f, entry.get('before'))}\n➡️ بعد: {_fmt_edit_value(f, entry.get('after'))}"
+    return (
+        f"✏️ <b>تعديل على طلب #{rec['id']}</b> (تعديل رقم {entry['n']})\n{LINE}\n"
+        f"👤 {_esc(rec['name'])}\n"
+        f'🆔 <a href="tg://user?id={rec["user_id"]}">{_esc(rec.get("tg_full_name") or rec["user_id"])}</a>{acct}\n'
+        f"📌 الحالة: {_STATUS_SHORT[rec['status']]}\n"
+        f"📝 الحقل: <b>{EDIT_LABELS[f]}</b>\n{body}\n{LINE}\n"
+        f"🕒 {_fmt_time(entry['at'])}"
+    )
+
+
+async def _send_media(bot, chat_id: int, kind: str, fid: str, caption: str):
+    if kind == "photo":
+        return await bot.send_photo(chat_id, fid, caption=caption, parse_mode=ParseMode.HTML)
+    return await bot.send_document(chat_id, fid, caption=caption, parse_mode=ParseMode.HTML)
+
+
+def _edit_missing(entry: dict) -> list:
+    return [a for a in sorted(ADMIN_IDS) if a not in (entry.get("notified") or [])]
+
+
+async def _send_edit_notice(context, rec: dict, entry: dict, only=None) -> int:
+    """Sends the before/after message to the admins who haven't got it yet. Returns how many admins received it."""
+    missing = _edit_missing(entry)
+    if only is not None:
+        missing = [a for a in missing if a in set(only)]
+    if not missing:
+        return 0
+    entry["tries"] = entry.get("tries", 0) + 1
+    text = _edit_notice_text(rec, entry)
+    got = 0
+    for admin_id in missing:
+        reply_to = (rec.get("admin_msgs") or {}).get(str(admin_id))
+        try:
+            await context.bot.send_message(
+                admin_id, text, parse_mode=ParseMode.HTML, link_preview_options=NO_PREVIEW,
+                reply_parameters=ReplyParameters(message_id=reply_to, allow_sending_without_reply=True) if reply_to else None)
+        except Exception as e:
+            log.error("Couldn't send the edit notice for #%s to admin %s: %s", rec["id"], admin_id, e)
+            continue
+        entry.setdefault("notified", []).append(admin_id)
+        got += 1
+        if entry["field"] == "photo":
+            for label, kind, fid in (("⬅️ قبل", entry["before_kind"], entry["before_id"]),
+                                     ("➡️ بعد", entry["after_kind"], entry["after_id"])):
+                try:
+                    await _send_media(context.bot, admin_id, kind, fid, f"{label} — طلب #{rec['id']}")
+                except Exception as e:
+                    log.error("Couldn't send the %s picture of #%s to admin %s: %s", label, rec["id"], admin_id, e)
+    try:
+        await commit()
+    except Exception:
+        log.exception("Couldn't save edit-notice state")
+    return got
+
+
+async def retry_edit_notices(context, only_admin=None, min_age: float = NOTIFY_RETRY_MIN_AGE, ignore_tries: bool = False) -> int:
+    n = 0
+    for rec in sorted(DATA["applications"].values(), key=lambda r: r["id"]):
+        for entry in rec.get("edits") or []:
+            if not (ignore_tries or only_admin is not None) and entry.get("tries", 0) >= MAX_EDIT_NOTICE_TRIES:
+                continue
+            missing = _edit_missing(entry)
+            if only_admin is not None:
+                missing = [a for a in missing if a == only_admin]
+            if not missing or _age_seconds(entry.get("at")) < min_age:
+                continue
+            n += await _send_edit_notice(context, rec, entry, only=missing)
+    return n
+
+
+async def _finish_edit(context, chat_id: int, form: dict, entry_msg, field: str, value, photo=None, q=None) -> None:
+    """Applies a correction the student just gave (typed message / photo = entry_msg, or a button = q), cleans the chat up,
+    shows the updated receipt, then tells the admins (before vs after) and refreshes every copy of the application."""
+    sid = str(form.get("app_id"))
+    try:
+        err, rec, entry = await apply_edit(chat_id, sid, field, value, photo)
+    except Exception:
+        log.exception("Couldn't save the edit on #%s", sid)
+        err, rec, entry = "error", None, None
+    if err:
+        text = _EDIT_ERRORS[err]
+        if q is not None:
+            await q.answer(text, show_alert=True)
+        elif entry_msg is not None:
+            await _warn(context, entry_msg, text)
+        if err in ("gone", "limit"):
+            context.user_data.pop("form", None)
+        return
+    if q is not None:
+        await q.answer()
+    await _delete_messages(context, chat_id, form.pop("junk", None) or [])
+    if DELETE_USER_ENTRIES and entry_msg is not None:
+        await _delete_messages(context, chat_id, [entry_msg.message_id])
+    prompt_id = form.get("prompt_id")
+    context.user_data.pop("form", None)
+    text = (f"✅ تم تعديل {EDIT_LABELS[field]} في طلب #{rec['id']}\nالإدارة اتبلغت بالتعديل ❤️‍🔥\n\n"
+            + _receipt(rec, f"طلب الحجز #{rec['id']}", _status_line(rec)))
+    kb = InlineKeyboardMarkup([[InlineKeyboardButton(STATUS_BTN, callback_data="status")]])
+    target = q.message if q is not None else (SimpleNamespace(text=True, message_id=prompt_id) if prompt_id else None)
+    await _show(context, chat_id, text, kb, target)
+    new_media = field == "photo"
+    try:
+        await _send_edit_notice(context, rec, entry)
+        await _refresh_admin_cards(context, rec, keep_buttons=True, new_media=new_media)
+        await _refresh_user_card(context, rec, new_media=new_media)
+        await _refresh_group_post(context, rec, new_media=new_media)
+    except Exception:
+        log.exception("Edit on #%s saved, but notifying/refreshing failed", sid)
+
+
+async def _handle_edit_text(context, chat_id: int, form: dict, msg, text: str) -> None:
+    field = form.get("field")
+    cleaner = {"name": clean_name, "username": clean_username, "phone": clean_phone}.get(field)
+    if cleaner is None:
+        await _warn(context, msg, "الصورة بس هي المقبولة هنا 🙏 ابعت صورة/سكرين شوت التحويل." if field == "photo"
+                    else "اختار من الأزرار اللي تحت 👇")
+        return
+    value = cleaner(text)
+    if not value:
+        bad = {"name": "ابعت اسمك الكامل (على الأقل اسمك واسم أبوك) 🙏",
+               "username": "اليوزر مش مظبوط 🙏\nلازم يبقى حروف إنجليزي وأرقام و _ (من 5 لـ 32 حرف). ابعته تاني.",
+               "phone": "الرقم مش مظبوط 🙏 ابعته تاني (أرقام بس)."}
+        await _warn(context, msg, bad[field])
+        return
+    await _finish_edit(context, chat_id, form, msg, field, value)
+
+
 # ── Background work ───────────────────────────────────────────────────────────
 async def housekeeping(ctx) -> None:
     """Every ~10 minutes: drop abandoned forms, remind the admins about applications nobody has decided on."""
+    try:
+        await retry_failed_notifications(ctx)
+        await retry_edit_notices(ctx)
+    except Exception:
+        log.exception("Retrying admin notifications failed")
     cutoff = (datetime.now(timezone.utc) - timedelta(days=DRAFT_TTL_DAYS)).isoformat(timespec="seconds")
     stale = [k for k, d in DATA["drafts"].items() if (d.get("updated_at") or "") < cutoff]
     for k in stale:
@@ -1821,13 +2726,16 @@ async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
     log.error("Unhandled error", exc_info=context.error)
 
 
-STUDENT_COMMANDS = [BotCommand("start", "ابدأ الحجز"), BotCommand("status", "حالة طلبي")]
+STUDENT_COMMANDS = [BotCommand("start", "ابدأ الحجز"), BotCommand("status", "حالة طلبي"),
+                    BotCommand("edit_request", "طلب تعديل على حجزك")]
 ADMIN_COMMANDS = STUDENT_COMMANDS + [
     BotCommand("pending", "الطلبات المعلقة"), BotCommand("summary", "ملخص الطلبات والمقاسات"),
     BotCommand("stats", "أرقام سريعة"), BotCommand("export", "تصدير الطلبات CSV"),
     BotCommand("open", "فتح الحجز"), BotCommand("close", "قفل الحجز"), BotCommand("limit", "حد المقاسات"),
     BotCommand("health", "حالة البوت"), BotCommand("backup", "نسخة احتياطية الآن"), BotCommand("restore", "استعادة"),
     BotCommand("setwelcome", "صورة الترحيب (ريبلاي على صورة)"), BotCommand("clearwelcome", "شيل صورة الترحيب"),
+    BotCommand("search", "بحث برقم الطلب / الاسم / الرقم / اليوزر"), BotCommand("retry", "إعادة إرسال الإشعارات الفاشلة"),
+    BotCommand("intro", "اختار الإنترو (ASCII) اللي بيظهر للكل"),
 ]
 
 
@@ -1891,9 +2799,11 @@ def main() -> None:
     for name, fn in (("start", start), ("status", cmd_status), ("pending", cmd_pending), ("summary", cmd_summary),
                      ("stats", cmd_stats), ("export", cmd_export), ("open", cmd_open), ("close", cmd_close),
                      ("limit", cmd_limit), ("health", cmd_health), ("backup", cmd_backup), ("restore", cmd_restore),
-                     ("setwelcome", cmd_setwelcome), ("clearwelcome", cmd_clearwelcome)):
+                     ("setwelcome", cmd_setwelcome), ("clearwelcome", cmd_clearwelcome),
+                     ("search", cmd_search), ("retry", cmd_retry), ("intro", cmd_intro), ("edit_request", cmd_edit_request)):
         app.add_handler(CommandHandler(name, fn, filters=private))
     app.add_handler(CallbackQueryHandler(on_admin_callback, pattern=r"^adm:"))
+    app.add_handler(CallbackQueryHandler(on_intro_callback, pattern=r"^intro:"))
     app.add_handler(CallbackQueryHandler(on_callback))
     app.add_handler(MessageHandler(private & (filters.PHOTO | filters.Document.IMAGE), on_image))
     app.add_handler(MessageHandler(private & filters.TEXT & ~filters.COMMAND, on_text))
