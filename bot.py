@@ -1870,6 +1870,15 @@ async def post_stop(app: Application) -> None:
 def main() -> None:
     if not BOT_TOKEN:
         raise SystemExit("Set the BOT_TOKEN environment variable.")
+
+    # Python 3.14 no longer creates a default event loop implicitly.
+    # python-telegram-bot's run_polling() calls asyncio.get_event_loop(),
+    # so install a fresh loop explicitly before building/running the app.
+    try:
+        asyncio.get_event_loop()
+    except RuntimeError:
+        asyncio.set_event_loop(asyncio.new_event_loop())
+
     builder = (Application.builder().token(BOT_TOKEN).post_init(post_init).post_stop(post_stop)
                .concurrent_updates(MAX_CONCURRENT_UPDATES))      # many students at once
     try:      # waits/retries when Telegram's flood limits are hit instead of dropping messages
