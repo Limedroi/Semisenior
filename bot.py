@@ -139,22 +139,22 @@ ASCII_LETTERS = {
 }
 ONBOARDING_WORD = "SEMISENIOR"
 
-# The same carefully spaced glyphs are used for single-letter and whole-word modes.
-# Different fills change the texture without changing the letter proportions.
+# Three complete visual identities, not just the same letters with different symbols.
+# Each theme has its own frame, typography treatment, and closing line.
 ASCII_SMALL = ASCII_LETTERS
 INTRO_STYLES = {
-    "hash":   ("# هاش", "#"),
-    "solid":  ("█ بلوك", "█"),
-    "star":   ("* نجوم", "*"),
-    "dot":    ("· نقط", "·"),
-    "shadow": ("▒ ظل", None),
+    # ASCII-only characters are intentional: Telegram clients disagree about
+    # the display width of Unicode blocks, box drawing, and emoji in <pre>.
+    "premium": ("PREMIUM / SIGNATURE", "#"),
+    "cyber":   ("CYBER / SYSTEM BOOT", "0"),
+    "varsity": ("VARSITY / LETTERMAN", "@"),
 }
 INTRO_MODES = {
     "letters": "1️⃣ حرف في كل رسالة",
     "words":   "2️⃣ رسالة SEMI + رسالة SENIOR",
     "morph":   "3️⃣ SEMI تتحول لـ SENIOR وتختفي",
 }
-INTRO_DEFAULT = ("solid", "words")   # clean block lettering, shown in two phone-friendly lines
+INTRO_DEFAULT = ("premium", "morph")   # signature frame, then a clean SEMI → SENIOR reveal
 INTRO_EVERY_START = False   # False = the intro plays the first time a person ever presses /start; True = on every /start
 INTRO_WORD_DELAY = 0.9      # "words" mode: seconds between SEMI and SENIOR
 INTRO_MORPH_FIRST = 1.5     # "morph" mode: how long SEMI shows before it turns into SENIOR
@@ -1096,39 +1096,36 @@ async def send_welcome(context: ContextTypes.DEFAULT_TYPE, chat_id: int, edit=No
     context.user_data["form"]["prompt_id"] = await _show(context, chat_id, text, kb, edit)
 
 
-def _shadow_rows(rows: list) -> list:
-    h, w = len(rows), max(len(r) for r in rows)
-    g = [r.ljust(w) for r in rows]
-    out = []
-    for r in range(h + 1):
-        line = ""
-        for c in range(w + 1):
-            on = r < h and c < w and g[r][c] == "#"
-            sh = r > 0 and c > 0 and g[r - 1][c - 1] == "#"
-            line += "█" if on else ("░" if sh else " ")
-        out.append(line)
-    return out
-
-
 def _style_rows(rows: list, style: str) -> list:
-    if style == "shadow":
-        return _shadow_rows(rows)
+    """Return the theme's large block lettering before the outer composition is added."""
     fill = INTRO_STYLES[style][1]
     return [r.replace("#", fill) for r in rows]
 
 
-def _render_letter(letter: str, style: str) -> str:
-    return "\n".join(r.rstrip() for r in _style_rows(ASCII_LETTERS[letter], style))
-
-
-def _render_word(word: str, style: str) -> str:
+def _base_word_art(word: str, style: str) -> list[str]:
     glyphs = []
     for ch in word:
         g = _style_rows(ASCII_SMALL[ch], style)
         w = max(len(r) for r in g)
         glyphs.append([r.ljust(w) for r in g])
-    gap = "" if style == "shadow" else " "          # a shadow glyph already carries its own spacing column
-    return "\n".join(gap.join(g[i] for g in glyphs).rstrip() for i in range(len(glyphs[0])))
+    return ["  ".join(g[i] for g in glyphs).rstrip() for i in range(len(glyphs[0]))]
+
+
+def _centered(text: str, width: int) -> str:
+    return text.center(width)
+
+
+def _compose_intro(word: str, style: str) -> str:
+    """Render only the spaced wordmark; no headers, frames, or taglines."""
+    return "\n".join(_base_word_art(word, style))
+
+
+def _render_letter(letter: str, style: str) -> str:
+    return _compose_intro(letter, style)
+
+
+def _render_word(word: str, style: str) -> str:
+    return _compose_intro(word, style)
 
 
 def _fade(art: str, ch: str) -> str:
@@ -2183,7 +2180,7 @@ def _intro_current_text() -> str:
 
 def _intro_home_payload():
     when = "في كل /start" if INTRO_EVERY_START else "لأي حد يدوس /start لأول مرة"
-    text = f"🎬 <b>الإنترو</b>\nالحالي: {_intro_current_text()}\nبيظهر {when}.\n\nاختار الشكل 👇"
+    text = f"🎬 <b>الإنترو</b>\nالحالي: {_intro_current_text()}\nبيظهر {when}.\n\nاختار الهوية البصرية 👇"
     btns = [InlineKeyboardButton(lab, callback_data=f"intro:s:{k}") for k, (lab, _f) in INTRO_STYLES.items()]
     rows = [btns[i:i + 2] for i in range(0, len(btns), 2)]
     rows.append([InlineKeyboardButton("🚫 من غير إنترو", callback_data="intro:off")])
@@ -2226,7 +2223,7 @@ async def on_intro_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         await _delete_intro_previews(context, chat_id, keep=q.message.message_id)
         rows = [[InlineKeyboardButton(lab, callback_data=f"intro:m:{style}:{m}")] for m, lab in INTRO_MODES.items()]
         rows.append([InlineKeyboardButton(BACK_BTN, callback_data="intro:home")])
-        await _show(context, chat_id, f"🎬 <b>{INTRO_STYLES[style][0]}</b>\nاختار الطريقة 👇", InlineKeyboardMarkup(rows), q.message)
+        await _show(context, chat_id, f"🎬 <b>{INTRO_STYLES[style][0]}</b>\nاختار طريقة العرض 👇", InlineKeyboardMarkup(rows), q.message)
     elif action == "m":                                              # mode chosen -> play it here as a preview
         await q.answer("▶️ بشغّل المعاينة…")
         await _delete_intro_previews(context, chat_id)
